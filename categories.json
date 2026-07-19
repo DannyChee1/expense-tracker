@@ -1,0 +1,13 @@
+{
+  "Groceries": ["loblaws", "no frills", "metro", "sobeys", "fortinos", "farm boy", "food basics", "walmart supercentre", "costco wholesale", "freshco", "whole foods"],
+  "Dining & Coffee": ["starbucks", "tim hortons", "mcdonald", "restaurant", "uber eats", "doordash", "skip the dishes", "pizza", "sushi", "cafe", "coffee", "bar & grill", "chipotle", "subway"],
+  "Transportation": ["uber", "lyft", "presto", "ttc", "go transit", "petro-canada", "shell", "esso", "parking", "taxi", "via rail"],
+  "Subscriptions": ["netflix", "spotify", "amazon prime", "apple.com/bill", "disney+", "youtube premium", "icloud", "adobe", "openai", "anthropic"],
+  "Utilities": ["hydro", "enbridge", "bell canada", "rogers", "telus", "fido", "koodo", "freedom mobile", "water bill"],
+  "Shopping": ["amazon.ca", "amazon.com", "best buy", "ikea", "canadian tire", "the bay", "winners", "sport chek", "indigo"],
+  "Health & Fitness": ["shoppers drug mart", "rexall", "goodlife", "planet fitness", "pharmacy", "dental", "clinic"],
+  "Travel": ["air canada", "westjet", "expedia", "airbnb", "marriott", "hilton", "booking.com"],
+  "Insurance & Fees": ["insurance", "annual fee", "annual membership fee", "interest charge", "nsf fee"],
+  "Payments & Credits": ["payment thank you", "payment received", "autopay", "online payment"],
+  "Entertainment": ["cineplex", "ticketmaster", "steam", "playstation", "xbox"]
+}
