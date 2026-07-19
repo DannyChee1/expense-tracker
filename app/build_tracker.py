@@ -13,11 +13,19 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.chart import PieChart, BarChart, LineChart, Reference
 from openpyxl.chart.label import DataLabelList
+from openpyxl.worksheet.table import Table, TableStyleInfo
+from openpyxl.worksheet.properties import PageSetupProperties
+from openpyxl.worksheet.datavalidation import DataValidation
+from openpyxl.worksheet.formula import ArrayFormula
+from openpyxl.workbook.defined_name import DefinedName
 
-BASE_DIR = Path(__file__).parent
-IMPORTS_DIR = BASE_DIR / "imports"
-CATEGORIES_FILE = BASE_DIR / "categories.json"
-OUTPUT_FILE = BASE_DIR / "expense_tracker.xlsx"
+# This file lives in the app/ subfolder; imports and the output xlsx live one
+# level up (the folder the user double-clicks in), configs live next to the code.
+APP_DIR = Path(__file__).parent
+ROOT_DIR = APP_DIR.parent
+IMPORTS_DIR = ROOT_DIR / "imports"
+OUTPUT_FILE = ROOT_DIR / "expense_tracker.xlsx"
+CATEGORIES_FILE = APP_DIR / "categories.json"
 
 NO_CITY = "(no city)"
 PAYMENTS_CAT = "Payments & Credits"
@@ -26,7 +34,21 @@ AMEX_MERCHANT_WIDTH = 23
 SCHEMA = ["SourceFile", "Card", "Date", "PostDate", "Description",
           "City", "Merchant", "Amount", "PreCategory"]
 
-MERCHANT_MAP_FILE = BASE_DIR / "merchant_map.json"
+MERCHANT_MAP_FILE = APP_DIR / "merchant_map.json"
+
+# ---------------------------------------------------------------------------
+# Display formats - edit these to change how dates and numbers are shown.
+# Date codes are Python strftime (%Y year, %b month name, %d day, %a weekday).
+# Money codes are Excel number formats.
+# ---------------------------------------------------------------------------
+FMT_DATE_CELL = "yyyy-mm-dd"          # Date column in the Transactions tab
+FMT_MONTH = "%Y-%m"                    # Month value + "Spend by Month" labels
+FMT_DOW = "%a"                         # Day-of-week labels (Mon, Tue, ...)
+FMT_DAILY_LABEL = "%b\n%d"             # daily spend-over-time x-axis (month over day)
+FMT_PERIOD = "%b %d"                   # period start/end in the subtitle
+FMT_UPDATED = "%Y-%m-%d %H:%M"         # "Updated ..." timestamp
+MONEY = '$#,##0.00;($#,##0.00);-'      # money format for cells
+AXIS_MONEY = '"$"#,##0'                # money format for chart axes/labels
 
 MONTHS = {m: i for i, m in enumerate(
     ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
@@ -92,6 +114,13 @@ def parse_amex_csv(path):
     desc_col = find("description", "merchant", "details", "payee")
     amount_col = find("amount")
     debit_col, credit_col = find("debit"), find("credit")
+
+    missing = [name for name, col in (("Date", date_col), ("Description", desc_col))
+               if col is None]
+    if amount_col is None and not (debit_col or credit_col):
+        missing.append("Amount")
+    if missing:
+        raise ValueError(f"CSV is missing a {', '.join(missing)} column - not a supported export")
 
     dates = pd.to_datetime(raw[date_col], errors="coerce")
     posts = pd.to_datetime(raw[post_col], errors="coerce")
@@ -250,8 +279,8 @@ def keyword_category(description, rules):
 
 def enrich_dates(df):
     df = df.copy()
-    df["Month"] = df["Date"].dt.strftime("%Y-%m")
-    df["DayOfWeek"] = df["Date"].dt.strftime("%a")
+    df["Month"] = df["Date"].dt.strftime(FMT_MONTH)
+    df["DayOfWeek"] = df["Date"].dt.strftime(FMT_DOW)
     return df.sort_values("Date").reset_index(drop=True)
 
 
@@ -320,7 +349,6 @@ def prompt_new_merchants(df, rules, mmap):
     return mmap
 
 
-MONEY = '$#,##0.00;($#,##0.00);-'
 INK = "1F4E78"
 HEADER_FILL = PatternFill("solid", fgColor=INK)
 TILE_FILL = PatternFill("solid", fgColor="EEF3F9")
@@ -345,7 +373,9 @@ def write_transactions(ws, df):
         c.fill = HEADER_FILL
         c.alignment = Alignment(horizontal="center")
     for r, row in enumerate(df.itertuples(index=False), start=2):
-        ws.cell(r, 1, row.Date.strftime("%Y-%m-%d")).font = BODY
+        d = ws.cell(r, 1, row.Date.to_pydatetime())
+        d.number_format = FMT_DATE_CELL
+        d.font = BODY
         ws.cell(r, 2, row.Card).font = BODY
         ws.cell(r, 3, row.Merchant).font = BODY
         ws.cell(r, 4, row.Description).font = BODY
@@ -359,146 +389,300 @@ def write_transactions(ws, df):
     for i, w in enumerate([12, 8, 26, 34, 18, 16, 13, 9, 6], start=1):
         ws.column_dimensions[get_column_letter(i)].width = w
     ws.freeze_panes = "A2"
-    ws.auto_filter.ref = f"A1:I{len(df) + 1}"
+    last = len(df) + 1
+    table = Table(displayName="TransactionsTable", ref=f"A1:I{last}")
+    table.tableStyleInfo = TableStyleInfo(name="TableStyleMedium2", showRowStripes=True)
+    ws.add_table(table)
+    return last
 
 
-def write_value_table(ws, top, title, series, money=True):
-    ws.cell(top, 1, title).font = Font(name="Arial", bold=True)
+def _table_header(data, top, title):
+    data.cell(top, 1, title).font = Font(name="Arial", bold=True)
     header = top + 1
     for col, label in ((1, "Item"), (2, "Amount")):
-        c = ws.cell(header, col, label)
+        c = data.cell(header, col, label)
         c.font = HEADER_FONT
         c.fill = HEADER_FILL
-    for i, (label, value) in enumerate(series.items(), start=1):
+    return header
+
+
+def write_dim_table(data, top, title, rows, key_range, base, amt, gross=False):
+    """One breakdown table whose values are filter-aware SUMPRODUCT formulas.
+    rows is a list of (display_label, match_value); match_value goes in hidden col C."""
+    header = _table_header(data, top, title)
+    for i, (disp, match) in enumerate(rows, start=1):
         r = header + i
-        ws.cell(r, 1, str(label)).font = BODY
-        c = ws.cell(r, 2, round(float(value), 2))
-        c.font = BODY
-        if money:
-            c.number_format = MONEY
-        ws.cell(r, 1).border = BORDER
-        ws.cell(r, 2).border = BORDER
-    return header, header + len(series)
+        data.cell(r, 1, disp).font = BODY
+        data.cell(r, 3, match)
+        expr = f'({key_range}=$C${r})*{base}'
+        if gross:
+            expr += f'*({amt}>0)'
+        cell = data.cell(r, 2)
+        cell.value = f'=SUMPRODUCT({expr}*{amt})'
+        cell.number_format = MONEY
+        cell.font = BODY
+        data.cell(r, 1).border = BORDER
+        data.cell(r, 2).border = BORDER
+    return header, header + len(rows)
 
 
-def chart_from(kind, title, ws, header, last, *, percent=False, values=False,
-               bar_dir="bar", height=8, width=15):
-    chart = kind()
+def write_size_table(data, top, title, bins, base, amt):
+    header = _table_header(data, top, title)
+    for i, (lo, hi, label) in enumerate(bins, start=1):
+        r = header + i
+        data.cell(r, 1, label).font = BODY
+        cond = f'{base}*({amt}>0)*({amt}>={lo})'
+        if hi is not None:
+            cond += f'*({amt}<{hi})'
+        cell = data.cell(r, 2)
+        cell.value = f'=SUMPRODUCT({cond})'
+        cell.number_format = '0'
+        cell.font = BODY
+        data.cell(r, 1).border = BORDER
+        data.cell(r, 2).border = BORDER
+    return header, header + len(bins)
+
+
+def _refs(ws, header, last):
+    return (Reference(ws, min_col=2, min_row=header, max_row=last),
+            Reference(ws, min_col=1, min_row=header + 1, max_row=last))
+
+
+def _value_labels(show_val=False, show_pct=False):
+    dl = DataLabelList()
+    dl.showVal = show_val
+    dl.showPercent = show_pct
+    dl.showCatName = False
+    dl.showSerName = False
+    dl.showLegendKey = False
+    dl.showBubbleSize = False
+    if show_val:
+        dl.numFmt = AXIS_MONEY
+    return dl
+
+
+def column_chart(title, ws, header, last, *, width=15, height=9):
+    chart = BarChart()
+    chart.type = "col"
     chart.title = title
     chart.style = 10
-    data = Reference(ws, min_col=2, min_row=header, max_row=last)
-    cats = Reference(ws, min_col=1, min_row=header + 1, max_row=last)
+    chart.gapWidth = 40
+    data, cats = _refs(ws, header, last)
     chart.add_data(data, titles_from_data=True)
     chart.set_categories(cats)
-    chart.height, chart.width = height, width
-    if kind is BarChart:
-        chart.type = bar_dir
-        chart.gapWidth = 60
-        chart.legend = None
-    if kind is LineChart:
-        chart.legend = None
-    if percent or values:
-        labels = DataLabelList()
-        labels.showPercent = percent
-        labels.showVal = values
-        labels.numFmt = MONEY if values else None
-        chart.dataLabels = labels
+    chart.legend = None
+    chart.x_axis.delete = False
+    chart.y_axis.delete = False
+    chart.x_axis.majorTickMark = "out"
+    chart.y_axis.numFmt = AXIS_MONEY
+    chart.y_axis.majorGridlines = None
+    chart.dataLabels = _value_labels(show_val=True)
+    chart.width, chart.height = width, height
     return chart
 
 
-def tile(ws, col, label, value, money=False):
-    span = f"{get_column_letter(col)}5:{get_column_letter(col + 2)}5"
-    vspan = f"{get_column_letter(col)}6:{get_column_letter(col + 2)}6"
-    ws.merge_cells(span)
-    ws.merge_cells(vspan)
-    lab = ws.cell(5, col, label)
+def pie_chart(title, ws, header, last, *, width=15, height=9):
+    chart = PieChart()
+    chart.title = title
+    chart.style = 10
+    data, cats = _refs(ws, header, last)
+    chart.add_data(data, titles_from_data=True)
+    chart.set_categories(cats)
+    chart.dataLabels = _value_labels(show_pct=True)
+    chart.legend.position = "r"
+    chart.width, chart.height = width, height
+    return chart
+
+
+def line_chart(title, ws, header, last, *, width=32, height=9):
+    chart = LineChart()
+    chart.title = title
+    chart.style = 12
+    data, cats = _refs(ws, header, last)
+    chart.add_data(data, titles_from_data=True)
+    chart.set_categories(cats)
+    chart.legend = None
+    chart.x_axis.delete = False
+    chart.y_axis.delete = False
+    chart.y_axis.numFmt = AXIS_MONEY
+    series = chart.series[0]
+    series.smooth = False
+    series.graphicalProperties.line.solidFill = INK
+    series.graphicalProperties.line.width = 22000
+    chart.width, chart.height = width, height
+    return chart
+
+
+def tile(ws, col, label, value, row=9, money=False, number=False):
+    lrow, vrow = row, row + 1
+    ws.merge_cells(start_row=lrow, start_column=col, end_row=lrow, end_column=col + 2)
+    ws.merge_cells(start_row=vrow, start_column=col, end_row=vrow, end_column=col + 2)
+    lab = ws.cell(lrow, col, label)
     lab.font = TILE_LABEL
     lab.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
-    val = ws.cell(6, col, value)
+    val = ws.cell(vrow, col, value)
     val.font = TILE_VALUE
     val.alignment = Alignment(horizontal="left", vertical="center")
     if money:
         val.number_format = MONEY
+    elif number:
+        val.number_format = '0'
     for c in range(col, col + 3):
-        ws.cell(5, c).fill = TILE_FILL
-        ws.cell(6, c).fill = TILE_FILL
-        ws.cell(5, c).border = BORDER
-        ws.cell(6, c).border = BORDER
+        for rr in (lrow, vrow):
+            ws.cell(rr, c).fill = TILE_FILL
+            ws.cell(rr, c).border = BORDER
+    ws.row_dimensions[lrow].height = 16
 
 
-def build_workbook(df, dupes_removed):
+def filter_label(ws, cell, text):
+    ws[cell] = text
+    ws[cell].font = Font(name="Arial", bold=True, size=9, color="5A5A5A")
+    ws[cell].alignment = Alignment(horizontal="right", vertical="center")
+
+
+def control_cell(ws, cell, value, is_date=False):
+    c = ws[cell]
+    c.value = value
+    c.font = Font(name="Arial", size=11, bold=True, color=INK)
+    c.fill = TILE_FILL
+    c.border = BORDER
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    if is_date:
+        c.number_format = FMT_DATE_CELL
+
+
+def build_workbook(df, dupes_removed, city="(All)", category="(All)",
+                   card="(All)", out=None):
     wb = Workbook()
+    wb.calculation.fullCalcOnLoad = True
     tx = wb.active
     tx.title = "Transactions"
-    write_transactions(tx, df)
+    n = write_transactions(tx, df)
 
     spend = df[df["Category"] != PAYMENTS_CAT]
-    purchases = spend[spend["Amount"] > 0]
-    total_spend = spend["Amount"].sum()
-    avg_purchase = purchases["Amount"].mean() if len(purchases) else 0
-    by_cat = spend.groupby("Category")["Amount"].sum().sort_values(ascending=False)
-    by_city = spend.groupby("City")["Amount"].sum().sort_values(ascending=False)
-    by_card = spend.groupby("Card")["Amount"].sum().sort_values(ascending=False)
-    by_dow = spend.groupby("DayOfWeek")["Amount"].sum().reindex(DAY_ORDER).fillna(0)
-    by_merch = spend.groupby("Merchant")["Amount"].sum().sort_values(ascending=False).head(12)
-    by_month = spend.groupby("Month")["Amount"].sum().sort_index()
-    cumulative = spend.groupby("Date")["Amount"].sum().sort_index().cumsum()
-    cumulative.index = [d.strftime("%m-%d") for d in cumulative.index]
-    top_city = by_city.index[0] if len(by_city) else "-"
-    period = f"{df['Date'].min():%b %d} - {df['Date'].max():%b %d, %Y}"
+    cat_labels = list(spend.groupby("Category")["Amount"].sum().sort_values(ascending=False).index)
+    city_labels = list(spend.groupby("City")["Amount"].sum().sort_values(ascending=False).index)
+    card_labels = list(spend.groupby("Card")["Amount"].sum().sort_values(ascending=False).index)
+    month_labels = sorted(spend["Month"].unique())
+    merch_full = list(spend.groupby("Merchant")["Amount"].sum().sort_values(ascending=False).head(8).index)
+    merch_disp = [m if len(m) <= 12 else m[:11] + "…" for m in merch_full]
+
+    dmin = df["Date"].min().to_pydatetime()
+    dmax = df["Date"].max().to_pydatetime()
+    period = f"{dmin.strftime(FMT_PERIOD)} - {dmax.strftime(FMT_PERIOD)}, {dmax.year}"
+
+    daily_rows = [(d.strftime(FMT_DAILY_LABEL), d.to_pydatetime())
+                  for d in pd.date_range(dmin, dmax, freq="D")]
+
+    f_city, f_cat, f_card = "Dashboard!$C$5", "Dashboard!$G$5", "Dashboard!$K$5"
+    f_from, f_to = "Dashboard!$C$7", "Dashboard!$G$7"
+
+    def rng(col):
+        return f"Transactions!${col}$2:${col}${n}"
+    r_date, r_card, r_merch, r_cat = rng("A"), rng("B"), rng("C"), rng("E")
+    r_city, r_amt, r_month, r_dow = rng("F"), rng("G"), rng("H"), rng("I")
+
+    base = (f'(({r_city}={f_city})+({f_city}="(All)"))'
+            f'*(({r_cat}={f_cat})+({f_cat}="(All)"))'
+            f'*(({r_card}={f_card})+({f_card}="(All)"))'
+            f'*({r_date}>={f_from})*({r_date}<={f_to})'
+            f'*({r_cat}<>"{PAYMENTS_CAT}")')
 
     data = wb.create_sheet("Data")
-    data.column_dimensions["A"].width = 26
+    data.column_dimensions["A"].width = 22
     data.column_dimensions["B"].width = 14
+
+    T = {}
     row = 1
-    tables = {}
-    for name, series in (("cat", by_cat), ("city", by_city), ("card", by_card),
-                         ("month", by_month), ("dow", by_dow), ("merch", by_merch),
-                         ("cum", cumulative)):
-        title = {"cat": "Spend by Category", "city": "Spend by City",
-                 "card": "Spend by Card", "month": "Spend by Month",
-                 "dow": "Spend by Day of Week", "merch": "Top Merchants",
-                 "cum": "Cumulative Spend"}[name]
-        tables[name] = write_value_table(data, row, title, series)
-        row = tables[name][1] + 2
+    T["cat"] = write_dim_table(data, row, "Spend by Category", [(c, c) for c in cat_labels], r_cat, base, r_amt); row = T["cat"][1] + 2
+    T["city"] = write_dim_table(data, row, "Spend by City", [(c, c) for c in city_labels], r_city, base, r_amt); row = T["city"][1] + 2
+    T["card"] = write_dim_table(data, row, "Spend by Card", [(c, c) for c in card_labels], r_card, base, r_amt); row = T["card"][1] + 2
+    T["month"] = write_dim_table(data, row, "Spend by Month", [(m, m) for m in month_labels], r_month, base, r_amt); row = T["month"][1] + 2
+    T["dow"] = write_dim_table(data, row, "Spend by Day of Week", [(d, d) for d in DAY_ORDER], r_dow, base, r_amt, gross=True); row = T["dow"][1] + 2
+    T["merch"] = write_dim_table(data, row, "Top Merchants", list(zip(merch_disp, merch_full)), r_merch, base, r_amt); row = T["merch"][1] + 2
+    size_bins = [(0, 10, "$0-10"), (10, 25, "$10-25"), (25, 50, "$25-50"), (50, 100, "$50-100"), (100, None, "$100+")]
+    T["size"] = write_size_table(data, row, "Transaction Size", size_bins, base, r_amt); row = T["size"][1] + 2
+
+    a_header = _table_header(data, row, "Spend Over Time (daily)")
+    for i, (disp, d) in enumerate(daily_rows, start=1):
+        r = a_header + i
+        data.cell(r, 1, disp).font = BODY
+        v = data.cell(r, 2)
+        v.value = f'=SUMPRODUCT(({r_date}=DATE({d.year},{d.month},{d.day}))*{base}*({r_amt}>0)*{r_amt})'
+        v.number_format = MONEY
+    T["trend"] = (a_header, a_header + len(daily_rows))
+
+    for col, values in ((20, ["(All)"] + city_labels), (21, ["(All)"] + cat_labels),
+                        (22, ["(All)"] + card_labels)):
+        for i, v in enumerate(values, start=1):
+            data.cell(i, col, v)
+
+    for col in ("C", "T", "U", "V"):
+        data.column_dimensions[col].hidden = True
 
     dash = wb.create_sheet("Dashboard", 0)
     dash.sheet_view.showGridLines = False
     dash.column_dimensions["A"].width = 2
-    for c in range(2, 20):
+    for c in range(2, 29):
         dash.column_dimensions[get_column_letter(c)].width = 10
+    dash.sheet_properties.pageSetUpPr = PageSetupProperties(fitToPage=True)
+    dash.page_setup.orientation = "landscape"
+    dash.page_setup.fitToWidth = 1
+    dash.page_setup.fitToHeight = 0
 
-    dash.merge_cells("B2:J2")
+    dash.merge_cells("B2:R2")
     dash["B2"] = "Expense Dashboard"
     dash["B2"].font = TITLE_FONT
-    dash.merge_cells("B3:J3")
-    dash["B3"] = f"Updated {datetime.now():%Y-%m-%d %H:%M}    |    Period {period}"
+    dash.merge_cells("B3:R3")
+    dash["B3"] = f"Updated {datetime.now().strftime(FMT_UPDATED)}    |    Period {period}"
     dash["B3"].font = SUB_FONT
-    dash.row_dimensions[5].height = 30
 
-    tile(dash, 2, "Total Spend (excl. payments)", round(float(total_spend), 2), money=True)
-    tile(dash, 6, "# Purchases", int(len(purchases)))
-    tile(dash, 10, "Avg Purchase", round(float(avg_purchase), 2), money=True)
-    tile(dash, 14, "Top City", top_city)
+    filters = [
+        ("B5", "City", "C5:D5", city, False),
+        ("F5", "Category", "G5:H5", category, False),
+        ("J5", "Card", "K5:L5", card, False),
+        ("B7", "From", "C7:D7", dmin, True),
+        ("F7", "To", "G7:H7", dmax, True),
+    ]
+    for label_cell, text, ctrl_range, value, is_date in filters:
+        filter_label(dash, label_cell, text)
+        dash.merge_cells(ctrl_range)
+        control_cell(dash, ctrl_range.split(":")[0], value, is_date=is_date)
+        for row_cells in dash[ctrl_range]:
+            for cc in row_cells:
+                cc.fill = TILE_FILL
+                cc.border = BORDER
 
-    dash.add_chart(chart_from(BarChart, "Spend by Category", data, *tables["cat"],
-                              values=True, bar_dir="bar", height=11, width=28), "B9")
-    dash.add_chart(chart_from(BarChart, "Spend by Month", data, *tables["month"],
-                              bar_dir="col"), "B33")
-    dash.add_chart(chart_from(BarChart, "Spend by City", data, *tables["city"]), "K33")
-    dash.add_chart(chart_from(BarChart, "Top Merchants", data, *tables["merch"]), "B50")
-    dash.add_chart(chart_from(BarChart, "Spend by Day of Week", data, *tables["dow"],
-                              bar_dir="col"), "K50")
-    dash.add_chart(chart_from(PieChart, "Spend by Card", data, *tables["card"],
-                              percent=True), "B67")
-    dash.add_chart(chart_from(LineChart, "Cumulative Spend Over Time", data,
-                              *tables["cum"], height=9, width=26), "B84")
+    for name, ref in (("CityList", f"Data!$T$1:$T${len(city_labels) + 1}"),
+                      ("CatList", f"Data!$U$1:$U${len(cat_labels) + 1}"),
+                      ("CardList", f"Data!$V$1:$V${len(card_labels) + 1}")):
+        wb.defined_names[name] = DefinedName(name, attr_text=ref)
+    for cell, listname in (("C5", "CityList"), ("G5", "CatList"),
+                           ("K5", "CardList")):
+        dv = DataValidation(type="list", formula1=f"={listname}", allow_blank=False)
+        dash.add_data_validation(dv)
+        dv.add(dash[cell])
 
-    save(wb, len(df), dupes_removed)
+    tile(dash, 2, "Total Spend (excl. payments)", f"=SUMPRODUCT({base}*{r_amt})", money=True)
+    tile(dash, 5, "# Purchases", f"=SUMPRODUCT({base}*({r_amt}>0))", number=True)
+    tile(dash, 8, "Avg Purchase",
+         f"=IFERROR(SUMPRODUCT({base}*({r_amt}>0)*{r_amt})/SUMPRODUCT({base}*({r_amt}>0)),0)", money=True)
+    tile(dash, 11, "Median Purchase",
+         ArrayFormula("K10", f"=MEDIAN(IF({base}*({r_amt}>0),{r_amt}))"), money=True)
+
+    dash.add_chart(pie_chart("Spend by Category", data, *T["cat"], width=16), "B12")
+    dash.add_chart(column_chart("Spend by Month", data, *T["month"], width=16), "J12")
+    dash.add_chart(column_chart("Spend by Day of Week", data, *T["dow"], width=16), "R12")
+    dash.add_chart(column_chart("Spend by City", data, *T["city"], width=16), "B30")
+    dash.add_chart(column_chart("Top Merchants", data, *T["merch"], width=16), "J30")
+    dash.add_chart(pie_chart("Spend by Card", data, *T["card"], width=16), "R30")
+    dash.add_chart(line_chart("Spend Over Time", data, *T["trend"], width=32), "B48")
+    dash.add_chart(column_chart("Transaction Size Distribution", data, *T["size"], width=16), "R48")
+
+    save(wb, len(df), dupes_removed, out or OUTPUT_FILE)
 
 
-def save(wb, n, dupes_removed):
-    target = OUTPUT_FILE
+def save(wb, n, dupes_removed, target=OUTPUT_FILE):
     try:
         wb.save(target)
     except PermissionError:
